@@ -1,0 +1,1 @@
+install the pytesseract here
