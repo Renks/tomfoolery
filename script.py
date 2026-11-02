@@ -317,7 +317,7 @@ def wait_for_confident_door(threshold=DOOR_MATCH_THRESHOLD, MAX_RETRIES=10):
 
 # ------------ OCR & GAME PROGRESS ------------
 
-def ocr_region(region):
+def wait_for_ocr_correct(region):
     # REFACTORED: Grabs screenshot from background handle context rather than pyautogui
     screenshot = capture_screen()
     if screenshot is None:
@@ -328,8 +328,11 @@ def ocr_region(region):
                 region[2], region[1] + region[3])
     image = screenshot.crop(crop_box).convert("L")
     image = image.resize((region[2] * 4, region[3] * 4))
-    text = pytesseract.image_to_string(image, config="--psm 7")
-    return text.strip()
+    text = pytesseract.image_to_string(image, config="--psm 7").strip()
+    # Santize the OCR output to remove any non-digit characters for door count and correct count
+    text = re.sub(r"[^\d/]", "", text)
+    text = text.replace(" ", "")
+    return text
 
 
 def read_game_progress():
@@ -338,7 +341,7 @@ def read_game_progress():
     door_text = f"{door_str}/{NUM_DOORS}"
 
     # Legacy Tesseract OCR for correct_text (left untouched)
-    correct_text = ocr_region(CORRECT_COUNT_BOX)
+    correct_text = wait_for_ocr_correct(CORRECT_COUNT_BOX)
 
     door_match = re.search(r"(\d+)\s*/\s*(\d+)", door_text, re.IGNORECASE)
     correct_match = re.search(r"(\d+)\s*correct", correct_text, re.IGNORECASE)
@@ -476,29 +479,6 @@ def crop_character(screenshot, door_number, round_number):
     crop.save(str(crop_path))
 
     return crop
-
-
-def is_last_door(screenshot):
-    width, height = screenshot.size
-
-    counter = screenshot.crop((
-        int(width * 0.28),
-        int(height * 0.07),
-        int(width * 0.72),
-        int(height * 0.20)
-    ))
-
-    counter = counter.resize(
-        (counter.width * 3, counter.height * 3)
-    ).convert("L")
-
-    counter_text = pytesseract.image_to_string(
-        counter, config="--psm 6"
-    )
-
-    print(f"Detected door counter text: {counter_text.strip()}")
-
-    return bool(re.search(r"\b10\s*/\s*10\b", counter_text))
 
 # ------------ MODEL ------------
 
