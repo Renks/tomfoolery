@@ -6,6 +6,7 @@ import threading
 import time
 from pathlib import Path
 
+import cv2
 import keyboard as keyboard_lib
 # Removed mss as we are shifting to a D3D background capture pipeline
 import torch
@@ -21,7 +22,6 @@ import win32ui
 import win32con
 import win32api
 import numpy as np
-from PIL import Image
 import ctypes  # Added for native Windows DLL access
 
 # ------------ SETTINGS ------------
@@ -61,9 +61,17 @@ CORRECT_COUNT_BOX = (830, 85, 115, 45)
 
 GUI_ELEMENTS_DIR = BASE_DIR / "guielements"
 PLAY_AGAIN_TEMPLATE_PATH = next(
-    iter(sorted(GUI_ELEMENTS_DIR.glob("*"))),
+    iter(sorted(p for p in GUI_ELEMENTS_DIR.glob("*") if p.is_file())),
     None,
 )
+
+# OpenCV Door Counter Template Settings
+TEMPLATE_DIR = GUI_ELEMENTS_DIR / "templates"
+CROP_BOX = (512, 92, 587, 126)  # Exact pixel coordinates for 1366x768 resolution
+DOOR_MATCH_THRESHOLD = 0.96     # Require >96% confidence before accepting door number
+TRIM_BORDER_PX = 2              # Trims template edges so matchTemplate can slide ±2px
+DOOR_RETRY_DELAY = 0.2          # Seconds to wait between retries when confidence <= 0.96
+TEMPLATES = {}
 
 AUTOCLICKER_START_DELAY = 0.5
 REPLAY_DELAY = 3
@@ -203,6 +211,112 @@ def write_background_text(text, TYPE_DELAY=0.08):
         _restore_foreground_window(previous_hwnd)
 
 
+# ------------ OPENCV DOOR TEMPLATE MATCHING ------------
+
+def preprocess_ui(gray_img):
+    """Isolates the UI font from changing backgrounds using Otsu binarization."""
+    blurred = cv2.GaussianBlur(gray_img, (3, 3), 0)
+    _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return binary
+
+
+def load_templates():
+    """Loads, binarizes, and trims reference .png templates from guielements/templates/door_{i}/."""
+    global TEMPLATES
+    total_loaded = 0
+    b = TRIM_BORDER_PX
+
+    for i in range(1, 11):
+        folder = TEMPLATE_DIR / f"door_{i}"
+        processed_list = []
+
+        for path in folder.glob("*.png"):
+            raw_gray = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+            if raw_gray is None:
+                continue
+
+            binary_tmpl = preprocess_ui(raw_gray)
+
+            # Trim outer border pixels so the template is slightly smaller than the live crop
+            if b > 0 and binary_tmpl.shape[0] > b * 2 and binary_tmpl.shape[1] > b * 2:
+                binary_tmpl = binary_tmpl[b:-b, b:-b]
+
+            processed_list.append(binary_tmpl)
+
+        TEMPLATES[i] = processed_list
+        total_loaded += len(processed_list)
+
+    print(f"Loaded and preprocessed {total_loaded} template(s) across 10 door folders from '{TEMPLATE_DIR}'.")
+    if total_loaded == 0:
+        print("WARNING: No template images were found! Check your 'guielements/templates/door_X/*.png' paths.")
+
+
+def crop_ui_region(screenshot):
+    """Crops the screenshot using the global CROP_BOX (supports pixels or 0.0-1.0 ratios)."""
+    left, top, right, bottom = CROP_BOX
+
+    if all(isinstance(v, float) and 0.0 <= v <= 1.0 for v in CROP_BOX):
+        left = int(screenshot.width * left)
+        top = int(screenshot.height * top)
+        right = int(screenshot.width * right)
+        bottom = int(screenshot.height * bottom)
+
+    if right > screenshot.width or bottom > screenshot.height or left < 0 or top < 0:
+        raise ValueError(
+            f"CROP_BOX {(left, top, right, bottom)} is outside screen size {screenshot.size}."
+        )
+
+    return screenshot.crop((left, top, right, bottom))
+
+
+def read_door_number(cropped_pil_img, threshold=DOOR_MATCH_THRESHOLD):
+    """Binarizes the live crop and compares it against preprocessed templates."""
+    gray_crop = cv2.cvtColor(np.array(cropped_pil_img), cv2.COLOR_RGB2GRAY)
+    binary_crop = preprocess_ui(gray_crop)
+
+    best_score = -1.0
+    best_door = None
+
+    for door_num, tmpl_list in TEMPLATES.items():
+        for tmpl in tmpl_list:
+            res = cv2.matchTemplate(binary_crop, tmpl, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, _ = cv2.minMaxLoc(res)
+
+            if max_val > best_score:
+                best_score = max_val
+                best_door = door_num
+
+    # Strictly require confidence above threshold (0.96)
+    if best_score > threshold and best_door is not None:
+        return str(best_door), best_score
+    return None, best_score
+
+
+def wait_for_confident_door(threshold=DOOR_MATCH_THRESHOLD, MAX_RETRIES=10):
+    """Waits until the door counter matches a template with > 0.96 confidence."""
+    retries = 0
+    while True:
+        screenshot = capture_screen()
+        if screenshot is None:
+            time.sleep(DOOR_RETRY_DELAY)
+            continue
+
+        cropped_ui = crop_ui_region(screenshot)
+        door_str, score = read_door_number(cropped_ui, threshold=threshold)
+
+        if door_str is not None:
+            return door_str, score
+
+        retries += 1
+        if retries >= MAX_RETRIES:
+            print(f"Failed to detect a confident door after {MAX_RETRIES} attempts. quitting.")
+            return None, 0
+
+        print(f"Waiting for door confidence > {threshold:.2f} (current best: {score:.3f})...")
+        time.sleep(DOOR_RETRY_DELAY)
+
+
+# ------------ OCR & GAME PROGRESS ------------
 
 def ocr_region(region):
     # REFACTORED: Grabs screenshot from background handle context rather than pyautogui
@@ -220,7 +334,11 @@ def ocr_region(region):
 
 
 def read_game_progress():
-    door_text = ocr_region(DOOR_COUNTER_BOX)
+    # Read door number via OpenCV template matching (waits until confidence > 0.96)
+    door_str, door_score = wait_for_confident_door(DOOR_MATCH_THRESHOLD)
+    door_text = f"{door_str}/{NUM_DOORS}"
+
+    # Legacy Tesseract OCR for correct_text (left untouched)
     correct_text = ocr_region(CORRECT_COUNT_BOX)
 
     door_match = re.search(r"(\d+)\s*/\s*(\d+)", door_text, re.IGNORECASE)
@@ -231,7 +349,7 @@ def read_game_progress():
     correct_count = int(correct_match.group(1)) if correct_match else None
 
     print(
-        f"HUD OCR: door={current_door}/{total_doors}, "
+        f"HUD Read: door={current_door}/{total_doors} (conf={door_score:.3f}), "
         f"correct={correct_count}, door_text={door_text!r}, "
         f"correct_text={correct_text!r}"
     )
@@ -621,6 +739,7 @@ def click_play_again(model, preprocess, device):
 # ------------ MAIN ------------
 
 def main():
+    load_templates()
     model, preprocess, device = load_model()
     reference_features, reference_names = load_knowledge_base(model, preprocess, device)
     print("\nModel and knowledge base are ready.")
@@ -658,4 +777,3 @@ if __name__ == "__main__":
             keyboard_lib.release("w")
         except Exception:
             pass
-
