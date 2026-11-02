@@ -6,11 +6,12 @@ import threading
 import time
 from pathlib import Path
 
-import keyboard
+import keyboard as keyboard_lib
 # Removed mss as we are shifting to a D3D background capture pipeline
 import torch
 import open_clip
 import pyautogui
+from pynput.keyboard import Controller as PynputKeyboardController, Key
 from pynput.mouse import Button, Controller
 from PIL import Image
 
@@ -18,6 +19,7 @@ from PIL import Image
 import win32gui
 import win32ui
 import win32con
+import win32api
 import numpy as np
 from PIL import Image
 import ctypes  # Added for native Windows DLL access
@@ -78,24 +80,128 @@ D3D_ENGINE = None
 
 # ------------ CONTROLS ------------
 
+# Virtual Key Codes
+VK_W = 0x57
+VK_RETURN = win32con.VK_RETURN
+VK_BACK = win32con.VK_BACK
+VK_A = 0x41
+VK_CONTROL = win32con.VK_CONTROL
+
+# Real keyboard controller for user-mode input. PyNput is more reliable than
+# raw ctypes SendInput for Roblox-style apps, especially when the game needs a
+# brief focus handoff before receiving key presses.
+keyboard_controller = PynputKeyboardController()
+
+
+def _focus_game_window():
+    """Brings the Roblox window to the foreground just long enough for the key press to register."""
+    global GAME_HWND
+    if not GAME_HWND:
+        return None
+
+    previous_hwnd = win32gui.GetForegroundWindow()
+    try:
+        if previous_hwnd != GAME_HWND:
+            win32gui.ShowWindow(GAME_HWND, win32con.SW_RESTORE)
+            win32gui.SetForegroundWindow(GAME_HWND)
+            time.sleep(0.08)
+    except Exception:
+        pass
+    return previous_hwnd
+
+
+def _restore_foreground_window(previous_hwnd):
+    """Restores the previous foreground window after the forged game input completes."""
+    if previous_hwnd and previous_hwnd != GAME_HWND:
+        try:
+            win32gui.SetForegroundWindow(previous_hwnd)
+        except Exception:
+            pass
+
+
+def _send_key_vk(vk_code, hold_seconds=0.05):
+    """Presses a virtual key using the real keyboard stack and restores focus afterward."""
+    try:
+        key_name = {
+            VK_W: 'w',
+            VK_RETURN: Key.enter,
+            VK_BACK: Key.backspace,
+            VK_A: 'a',
+            VK_CONTROL: Key.ctrl_l,
+        }.get(vk_code)
+        if key_name is None:
+            return
+        keyboard_controller.press(key_name)
+        time.sleep(hold_seconds)
+        keyboard_controller.release(key_name)
+    except Exception as exc:
+        print(f"Key press failed for vk={vk_code}: {exc}")
+
+
+def _send_unicode_char(char):
+    """Injects a typed character using the foreground keyboard controller."""
+    try:
+        keyboard_controller.type(char)
+    except Exception as exc:
+        print(f"Unicode input failed for char {char!r}: {exc}")
+
 
 def move_forward(seconds):
-    keyboard.press("w")
+    """Presses W while briefly focusing Roblox so the game receives the input."""
+    global GAME_HWND
+    if not GAME_HWND:
+        return
+    previous_hwnd = _focus_game_window()
     try:
-        time.sleep(seconds)
+        _send_key_vk(VK_W, hold_seconds=seconds)
     finally:
-        keyboard.release("w")
+        _restore_foreground_window(previous_hwnd)
 
 
 def press_enter():
-    keyboard.press_and_release("enter")
+    """Presses Enter while Roblox is briefly activated."""
+    global GAME_HWND
+    if not GAME_HWND:
+        return
+    previous_hwnd = _focus_game_window()
+    try:
+        _send_key_vk(VK_RETURN, hold_seconds=0.05)
+    finally:
+        _restore_foreground_window(previous_hwnd)
 
 
 def clear_textbox():
-    keyboard.press_and_release("ctrl+a")
-    time.sleep(0.15)
-    keyboard.press_and_release("backspace")
-    time.sleep(0.2)
+    """Clears the active text box by selecting all and deleting."""
+    global GAME_HWND
+    if not GAME_HWND:
+        return
+    previous_hwnd = _focus_game_window()
+    try:
+        with keyboard_controller.pressed(Key.ctrl_l):
+            keyboard_controller.press('a')
+            keyboard_controller.release('a')
+        time.sleep(0.08)
+        keyboard_controller.press(Key.backspace)
+        time.sleep(0.02)
+        keyboard_controller.release(Key.backspace)
+        time.sleep(0.05)
+    finally:
+        _restore_foreground_window(previous_hwnd)
+
+
+def write_background_text(text, TYPE_DELAY=0.08):
+    """Types the guessed character name while briefly giving Roblox focus."""
+    global GAME_HWND
+    if not GAME_HWND:
+        return
+    previous_hwnd = _focus_game_window()
+    try:
+        for char in text:
+            _send_unicode_char(char)
+            time.sleep(TYPE_DELAY)
+    finally:
+        _restore_foreground_window(previous_hwnd)
+
 
 
 def ocr_region(region):
@@ -444,7 +550,8 @@ def play_round(round_number, model, preprocess, device, reference_features, refe
                 time.sleep(final_delay)
                 
             clear_textbox()
-            keyboard.write(name, delay=TYPE_DELAY)
+            # keyboard.write(name, delay=TYPE_DELAY)
+            write_background_text(name, 0.08)
             time.sleep(0.3)
             print(f"Submitting: {name}")
             press_enter()
@@ -548,7 +655,7 @@ if __name__ == "__main__":
         print("\nBot stopped by user.")
     finally:
         try:
-            keyboard.release("w")
+            keyboard_lib.release("w")
         except Exception:
             pass
 
