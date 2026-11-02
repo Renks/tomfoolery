@@ -1,0 +1,15 @@
+# Core runtime dependencies used by script.py
+numpy==2.3.5
+opencv-python==5.0.0.93
+Pillow==13.0.0
+PyAutoGUI==0.9.54
+pytesseract==0.3.13
+keyboard==0.13.5
+pynput==1.8.2
+pywin32==312
+
+torch==2.15.0+cpu
+open-clip-torch==3.3.0
+
+# Tesseract OCR is also required as a system binary at:
+# Tesseract-OCR\tesseract.exe
